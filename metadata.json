@@ -1,0 +1,6 @@
+{
+  "name": "Trò Chơi Nghiêng Đầu Chọn Đáp Án",
+  "description": "Ứng dụng web trò chơi giáo dục tương tác điều khiển bằng chuyển động nghiêng đầu qua camera dành cho giáo viên và học sinh từ Mầm non đến THPT.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
