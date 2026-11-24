@@ -56,6 +56,14 @@ export const SOUTHERN_VOICE_OPTIONS: SouthernVoiceOption[] = [
 // In-memory cache of base64 WAV audio keyed by `${voiceId}::${text}`
 const ttsCache = new Map<string, string>();
 let activeAudio: HTMLAudioElement | null = null;
+let activeObjectUrl: string | null = null;
+
+function revokeActiveObjectUrl(): void {
+  if (activeObjectUrl) {
+    URL.revokeObjectURL(activeObjectUrl);
+    activeObjectUrl = null;
+  }
+}
 
 export function stopActiveAiVoice(): void {
   if (activeAudio) {
@@ -65,6 +73,7 @@ export function stopActiveAiVoice(): void {
     activeAudio.src = '';
     activeAudio = null;
   }
+  revokeActiveObjectUrl();
 }
 
 export async function fetchAiVoiceBase64(
@@ -86,13 +95,35 @@ export async function fetchAiVoiceBase64(
     body: JSON.stringify({ text: cleanText, voiceId }),
   });
 
-  const data = (await response.json()) as { audioBase64?: string; error?: string };
+  const rawBody = await response.text();
+  let data: { audioBase64?: string; error?: string } = {};
+  if (rawBody) {
+    try {
+      data = JSON.parse(rawBody) as { audioBase64?: string; error?: string };
+    } catch {
+      // Non-JSON response (e.g. 404/502 HTML from hosting layer)
+    }
+  }
+
   if (!response.ok || !data.audioBase64) {
-    throw new Error(data.error || 'Không thể tạo giọng đọc AI.');
+    throw new Error(
+      data.error ||
+        `Không thể tạo giọng đọc AI (Mã HTTP ${response.status}). Kiểm tra cấu hình /api/tts và biến môi trường GEMINI_API_KEY.`
+    );
   }
 
   ttsCache.set(key, data.audioBase64);
   return data.audioBase64;
+}
+
+function base64ToWavBlobUrl(base64: string): string {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const blob = new Blob([bytes], { type: 'audio/wav' });
+  return URL.createObjectURL(blob);
 }
 
 export async function playAiVoiceFeedback(
@@ -102,22 +133,32 @@ export async function playAiVoiceFeedback(
   stopActiveAiVoice();
 
   const audioBase64 = await fetchAiVoiceBase64(text, voiceId);
+  const objectUrl = base64ToWavBlobUrl(audioBase64);
+  activeObjectUrl = objectUrl;
 
   await new Promise<void>((resolve, reject) => {
-    const audio = new Audio(`data:audio/wav;base64,${audioBase64}`);
+    const audio = new Audio(objectUrl);
     activeAudio = audio;
 
-    audio.onended = () => {
+    const cleanup = () => {
       if (activeAudio === audio) activeAudio = null;
+      if (activeObjectUrl === objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+        activeObjectUrl = null;
+      }
+    };
+
+    audio.onended = () => {
+      cleanup();
       resolve();
     };
     audio.onerror = () => {
-      if (activeAudio === audio) activeAudio = null;
+      cleanup();
       reject(new Error('Không thể phát tệp âm thanh phản hồi.'));
     };
 
     audio.play().catch((err) => {
-      if (activeAudio === audio) activeAudio = null;
+      cleanup();
       reject(err);
     });
   });

@@ -46,8 +46,16 @@ const SOUTHERN_VIETNAMESE_VOICES: Record<string, VoiceProfile> = {
 };
 
 function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+  const candidates = [
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY,
+    process.env.GOOGLE_API_KEY,
+  ];
+  const apiKey = candidates
+    .map((k) => (typeof k === 'string' ? k.trim() : ''))
+    .find((k) => Boolean(k) && k !== 'MY_GEMINI_API_KEY');
+
+  if (!apiKey) {
     return null;
   }
   return new GoogleGenAI({
@@ -61,52 +69,100 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
+function ensureWavBase64(base64Data: string, mimeType?: string): string {
+  const rawBuf = Buffer.from(base64Data, 'base64');
+  if (rawBuf.length >= 12 && rawBuf.subarray(0, 4).toString('ascii') === 'RIFF') {
+    return base64Data;
+  }
+
+  const normalizedMime = (mimeType || '').toLowerCase();
+  if (
+    normalizedMime &&
+    !normalizedMime.includes('l16') &&
+    !normalizedMime.includes('pcm') &&
+    !normalizedMime.includes('wav')
+  ) {
+    return base64Data;
+  }
+
+  const sampleRate = 24000;
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const dataSize = rawBuf.length;
+
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataSize, 40);
+
+  return Buffer.concat([header, rawBuf]).toString('base64');
+}
+
 async function generateSouthernVietnameseSpeech(
   ai: GoogleGenAI,
   text: string,
   profile: VoiceProfile
 ): Promise<string | undefined> {
-  const requestPayload = (model: string) => ({
-    model,
-    contents: [
-      {
-        role: 'user',
-        parts: [
+  const attempts: Array<{ model: string; useSpeechMetadata: boolean }> = [
+    { model: 'gemini-3.8-flash-tts', useSpeechMetadata: true },
+    { model: 'gemini-3.8-flash-lite-tts', useSpeechMetadata: true },
+    { model: 'gemini-2.5-flash-preview-tts', useSpeechMetadata: false },
+  ];
+
+  let lastError: unknown = null;
+
+  for (const attempt of attempts) {
+    try {
+      const part = attempt.useSpeechMetadata
+        ? { text, speechMetadata: { style: profile.style } }
+        : { text };
+
+      const response = await ai.models.generateContent({
+        model: attempt.model,
+        contents: [
           {
-            text,
-            speechMetadata: {
-              style: profile.style,
-            },
+            role: 'user',
+            parts: [part],
           },
         ],
-      },
-    ],
-    config: {
-      responseModalities: ['AUDIO'],
-      speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: { voiceName: profile.prebuiltVoice },
+        config: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: profile.prebuiltVoice },
+            },
+          },
         },
-      },
-    },
-  });
+      });
 
-  try {
-    const response = await ai.models.generateContent(
-      requestPayload('gemini-3.8-flash-tts')
-    );
-    return response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-  } catch (err) {
-    // Fallback to lite TTS if flash-tts returns 404 or transient unavailability
-    const message = err instanceof Error ? err.message : '';
-    if (message.includes('404') || message.includes('NOT_FOUND')) {
-      const fallbackResponse = await ai.models.generateContent(
-        requestPayload('gemini-3.8-flash-lite-tts')
-      );
-      return fallbackResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      const inlineData = response.candidates?.[0]?.content?.parts?.find(
+        (p) => Boolean(p.inlineData?.data)
+      )?.inlineData;
+
+      if (inlineData?.data) {
+        return ensureWavBase64(inlineData.data, inlineData.mimeType);
+      }
+    } catch (err) {
+      lastError = err;
     }
-    throw err;
   }
+
+  if (lastError) {
+    throw lastError;
+  }
+  return undefined;
 }
 
 async function startServer() {
@@ -133,7 +189,7 @@ async function startServer() {
       if (!ai) {
         res.status(503).json({
           error:
-            'Chưa thiết lập GEMINI_API_KEY trên máy chủ. Vui lòng kiểm tra mục Settings > Secrets.',
+            'Chưa thiết lập GEMINI_API_KEY trên máy chủ. Vui lòng kiểm tra mục Settings > Secrets (hoặc Environment Variables trên Vercel).',
         });
         return;
       }
